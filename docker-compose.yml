@@ -1,0 +1,19 @@
+services:
+  whatsapp-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp-bridge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8181:8080"
+    volumes:
+      # Persistent WhatsApp session + message store
+      # Mounted to host so MCP server (running on host) can read messages.db
+      - ./store:/app/store
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/login/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

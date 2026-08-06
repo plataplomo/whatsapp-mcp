@@ -1,0 +1,21 @@
+# Binaries
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/store/
+whatsapp-mcp-server/.venv/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# Git
+.git/
+.gitignore
