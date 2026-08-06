@@ -24,6 +24,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -847,6 +848,10 @@ func main() {
 			return
 		}
 	}
+
+	// Set device OS name to look like a real browser, not "whatsmeow"
+	// This affects how the device appears in WhatsApp → Linked Devices
+	store.SetOSInfo("Ubuntu", [3]uint32{128, 0, 0})
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
