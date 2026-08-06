@@ -685,6 +685,28 @@ var (
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Handler for QR pairing page (auto-refresh)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/qr" || r.URL.Path == "/login/status" ||
+			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" {
+			// Let other handlers deal with these paths
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WhatsApp QR</title><style>body{background:#111;color:#eee;display:flex;
+flex-direction:column;align-items:center;justify-content:center;min-height:100vh;
+margin:0;font-family:system-ui,sans-serif}img{max-width:400px;width:90vw;border-radius:12px}
+#s{margin-top:16px;font-size:1.1em}</style></head><body>
+<img id="q" src="/qr" alt="QR"><div id="s">...</div>
+<script>async function r(){try{const d=await(await fetch('/login/status')).json();
+document.getElementById('s').textContent='Status: '+d.status;if(d.status==='connected')
+{document.getElementById('s').textContent='✅ Connected!';return;}}catch(e){}
+document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script>
+</body></html>`)
+	})
+
 	// Handler for serving the current QR code as PNG image
 	http.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
 		if currentQRCode == "" {

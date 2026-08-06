@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WhatsApp QR Pair</title>
+    <style>
+        body {
+            background: #111;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            font-family: system-ui, sans-serif;
+        }
+        #qr {
+            max-width: 400px;
+            width: 90vw;
+            border-radius: 12px;
+        }
+        #status {
+            margin-top: 16px;
+            font-size: 1.1em;
+        }
+    </style>
+</head>
+<body>
+    <img id="qr" src="/qr" alt="QR Code" />
+    <div id="status">QR обновляется каждые 5 сек...</div>
+    <script>
+        async function refresh() {
+            try {
+                const resp = await fetch('/login/status');
+                const data = await resp.json();
+                document.getElementById('status').textContent =
+                    'Status: ' + data.status;
+                if (data.status === 'connected') {
+                    document.getElementById('status').textContent = '✅ Подключено!';
+                    return;
+                }
+            } catch (e) {}
+            // Refresh QR image
+            document.getElementById('qr').src = '/qr?t=' + Date.now();
+        }
+        setInterval(refresh, 5000);
+    </script>
+</body>
+</html>
