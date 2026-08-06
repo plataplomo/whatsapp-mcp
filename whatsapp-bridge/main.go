@@ -849,9 +849,9 @@ func main() {
 		}
 	}
 
-	// Set device OS name to look like a real browser, not "whatsmeow"
+	// Set device OS name to mimic Google Chrome on Windows
 	// This affects how the device appears in WhatsApp → Linked Devices
-	store.SetOSInfo("Ubuntu", [3]uint32{128, 0, 0})
+	store.SetOSInfo("Windows", [3]uint32{128, 0, 0})
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
