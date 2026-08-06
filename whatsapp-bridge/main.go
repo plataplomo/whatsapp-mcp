@@ -24,6 +24,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -871,9 +872,12 @@ func main() {
 		}
 	}
 
-	// Set device OS name to mimic Google Chrome on Windows
+	// Set device identity to mimic Google Chrome on Windows
 	// This affects how the device appears in WhatsApp → Linked Devices
 	store.SetOSInfo("Windows", [3]uint32{128, 0, 0})
+	// Override platform type from UNKNOWN to CHROME so WhatsApp shows
+	// "Google Chrome (Windows)" instead of just "Windows"
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
