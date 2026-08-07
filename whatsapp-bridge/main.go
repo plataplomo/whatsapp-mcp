@@ -962,38 +962,75 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 			mediaRetryCacheLock.Unlock()
 
 			if result.Error != nil {
-				errStr := result.Error.Error()
-				// Error code 2 = media not available on phone via MediaRetry.
-				// Try BuildUnavailableMessageRequest instead — asks the phone
-				// to resend the ENTIRE message with fresh media credentials.
-				if strings.Contains(errStr, "code 2") && attempt < maxRetries {
-					fmt.Printf("MediaRetry code 2, trying unavailable message request...\n")
-					_, umErr := requestUnavailableMessage(client, messageStore, messageID, chatJID)
-					if umErr != nil {
-						fmt.Printf("Unavailable message request failed: %v\n", umErr)
-					} else {
-						fmt.Printf("Unavailable message succeeded, retrying with fresh proto...\n")
-						continue // retry loop — will re-read updated proto from DB
+					errStr := result.Error.Error()
+					if strings.Contains(errStr, "code 2") && attempt < maxRetries {
+						// Error code 2: try PN participant, then on-demand history sync
+						pnSender, pnErr := resolveLIDToPN(client, parsedEvt.Info.Sender)
+						ownLID := client.Store.GetLID()
+
+						if pnErr == nil && !pnSender.IsEmpty() && pnSender.String() != parsedEvt.Info.Sender.String() {
+							for _, toAddr := range []types.JID{ownLID, ownID} {
+								pnResultCh := make(chan *retryResult, 1)
+								mediaRetryCacheLock.Lock()
+								mediaRetryCache[messageID] = &pendingMediaRetry{Result: pnResultCh, MediaKey: mediaKey}
+								mediaRetryCacheLock.Unlock()
+
+								pnStanza := buildRetryStanza(toAddr, messageID, parsedEvt.Info.Chat, parsedEvt.Info.IsFromMe, pnSender, mediaKey)
+								fmt.Printf("Sending MediaRetry (to=%s, participant=%s)\n", toAddr.String(), pnSender.String())
+								if sendErr := client.DangerousInternals().SendNode(context.Background(), pnStanza); sendErr != nil {
+									fmt.Printf("Send failed: %v\n", sendErr)
+									continue
+								}
+
+								select {
+								case pnResult := <-pnResultCh:
+									mediaRetryCacheLock.Lock()
+									delete(mediaRetryCache, messageID)
+									mediaRetryCacheLock.Unlock()
+									if pnResult.Error == nil {
+										fmt.Printf("MediaRetry SUCCESS!\n")
+										result = pnResult
+										// Break out of error handling — fall through to download
+										goto downloadMedia
+									}
+									fmt.Printf("Got error: %v\n", pnResult.Error)
+								case <-time.After(15 * time.Second):
+									fmt.Printf("Timeout\n")
+									mediaRetryCacheLock.Lock()
+									delete(mediaRetryCache, messageID)
+									mediaRetryCacheLock.Unlock()
+								}
+							}
+						}
+
+						// On-demand history sync with newer anchor to get fresh URLs
+						fmt.Printf("Requesting on-demand history sync with newer anchor...\n")
+						_, odErr := requestOnDemandHistory(client, messageStore, messageID, chatJID)
+						if odErr != nil {
+							fmt.Printf("On-demand history sync failed: %v\n", odErr)
+						} else {
+							fmt.Printf("On-demand history sync done, retrying...\n")
+							continue // retry loop — will re-read updated proto from DB
+						}
 					}
+					return false, mediaType, filename, "", result.Error
 				}
-				return false, mediaType, filename, "", result.Error
-			}
 
-			// Step 8: Update DirectPath in the message and download
-			// Per docs: "imageMsg.DirectPath = retryData.DirectPath; data, err := cli.Download(imageMsg)"
-			fmt.Printf("Got new media path for %s, downloading with SHA verification...\n", messageID)
+			downloadMedia:
+				// Step 8: Update DirectPath in the message and download
+				fmt.Printf("Got new media path for %s, downloading with SHA verification...\n", messageID)
 
-			// Update the direct path on the downloadable message
-			switch m := downloadableMsg.(type) {
-			case *waProto.ImageMessage:
-				m.DirectPath = &result.DirectPath
-			case *waProto.DocumentMessage:
-				m.DirectPath = &result.DirectPath
-			case *waProto.VideoMessage:
-				m.DirectPath = &result.DirectPath
-			case *waProto.AudioMessage:
-				m.DirectPath = &result.DirectPath
-			case *waProto.StickerMessage:
+				// Update the direct path on the downloadable message
+				switch m := downloadableMsg.(type) {
+				case *waProto.ImageMessage:
+					m.DirectPath = &result.DirectPath
+				case *waProto.DocumentMessage:
+					m.DirectPath = &result.DirectPath
+				case *waProto.VideoMessage:
+					m.DirectPath = &result.DirectPath
+				case *waProto.AudioMessage:
+					m.DirectPath = &result.DirectPath
+				case *waProto.StickerMessage:
 				m.DirectPath = &result.DirectPath
 			}
 
@@ -1189,14 +1226,36 @@ func requestOnDemandHistory(client *whatsmeow.Client, messageStore *MessageStore
 		messageID, chatJID,
 	).Scan(&msgTimestamp, &msgIsFromMe)
 
+	// IMPORTANT: BuildHistorySyncRequest returns messages BEFORE OldestMsgID.
+	// To get the target message included, we must pass a NEWER message as anchor.
+	// Find the next message after our target in the same chat.
+	var newerMsgID string
+	var newerMsgTimestamp time.Time
+	var newerMsgIsFromMe bool
+	_ = messageStore.db.QueryRow(
+		"SELECT id, timestamp, is_from_me FROM messages WHERE chat_jid = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT 1",
+		chatJID, msgTimestamp,
+	).Scan(&newerMsgID, &newerMsgTimestamp, &newerMsgIsFromMe)
+
+	anchorID := messageID
+	anchorTs := msgTimestamp
+	anchorFromMe := msgIsFromMe
+	if newerMsgID != "" {
+		// Use the newer message as anchor so the target is included in results
+		anchorID = newerMsgID
+		anchorTs = newerMsgTimestamp
+		anchorFromMe = newerMsgIsFromMe
+		fmt.Printf("Using newer message %s as anchor (ts=%v) to include target %s\n", anchorID, anchorTs, messageID)
+	}
+
 	msgInfo := &types.MessageInfo{
 		MessageSource: types.MessageSource{
 			Chat:     jid,
-			IsFromMe: msgIsFromMe,
+			IsFromMe: anchorFromMe,
 			IsGroup:  strings.Contains(chatJID, "@g.us"),
 		},
-		ID:        messageID,
-		Timestamp: msgTimestamp,
+		ID:        anchorID,
+		Timestamp: anchorTs,
 	}
 
 	// Build and send on-demand history sync request
@@ -1221,6 +1280,51 @@ func requestOnDemandHistory(client *whatsmeow.Client, messageStore *MessageStore
 		return result.ProtoBytes, nil
 	case <-time.After(30 * time.Second):
 		return nil, fmt.Errorf("on-demand history sync timeout")
+	}
+}
+
+// resolveLIDToPN resolves a LID JID to its phone number JID using whatsmeow's LID store.
+func resolveLIDToPN(client *whatsmeow.Client, lid types.JID) (types.JID, error) {
+	if lid.Server != types.HiddenUserServer {
+		return lid, nil // already PN
+	}
+	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), lid)
+	if err != nil {
+		return types.JID{}, err
+	}
+	return pn, nil
+}
+
+// buildRetryStanza builds a raw MediaRetry receipt stanza with proper JID types.
+func buildRetryStanza(ownID types.JID, messageID string, chatJID types.JID, isFromMe bool, participant types.JID, mediaKey []byte) waBinary.Node {
+	encCiphertext, encIV, _ := encryptMediaRetryReceiptLocal(messageID, mediaKey)
+
+	content := []waBinary.Node{
+		{Tag: "rmr", Attrs: waBinary.Attrs{
+			"jid":         chatJID,
+			"from_me":     isFromMe,
+			"participant": participant,
+		}},
+	}
+	if encCiphertext != nil {
+		encryptNode := waBinary.Node{
+			Tag: "encrypt",
+			Content: []waBinary.Node{
+				{Tag: "enc_p", Content: encCiphertext},
+				{Tag: "enc_iv", Content: encIV},
+			},
+		}
+		content = []waBinary.Node{encryptNode, content[0]}
+	}
+
+	return waBinary.Node{
+		Tag: "receipt",
+		Attrs: waBinary.Attrs{
+			"id":   messageID,
+			"to":   ownID,
+			"type": "server-error",
+		},
+		Content: content,
 	}
 }
 
