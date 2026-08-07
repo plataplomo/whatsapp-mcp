@@ -25,6 +25,8 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waMmsRetry "go.mau.fi/whatsmeow/proto/waMmsRetry"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
@@ -880,71 +882,21 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 		mediaRetryCache[messageID] = pending
 		mediaRetryCacheLock.Unlock()
 
-		// Step 6: Send MediaRetryReceipt via raw stanza.
-		// For LID-migrated messages, the phone may use a different key
-		// to encrypt/decrypt the retry receipt. Try BOTH mediaKey and
-		// messageSecret as the encryption key.
-		ownID := client.Store.ID.ToNonAD()
+		// Step 6: Send MediaRetryReceipt using whatsmeow's public API.
+		// This is the canonical method — the phone responds reliably.
+		retryInfo := parsedEvt.Info
 
-		// Get messageSecret from whatsmeow store
+		fmt.Printf("Sending MediaRetry: chat=%s, sender=%s, id=%s, isFromMe=%v\n",
+			retryInfo.Chat.String(), retryInfo.Sender.String(),
+			retryInfo.ID, retryInfo.IsFromMe)
+
+		// Get messageSecret for potential later use
 		msgSecret, _, _ := client.Store.MsgSecrets.GetMessageSecret(
 			context.Background(), parsedEvt.Info.Chat, parsedEvt.Info.Sender, types.MessageID(messageID))
+		_ = msgSecret
+		ownID := client.Store.ID.ToNonAD()
 
-		// Try with messageSecret first (for LID-migrated messages)
-		var encCiphertext, encIV []byte
-		var useKey []byte
-		if msgSecret != nil {
-			encCiphertext, encIV, _ = encryptMediaRetryReceiptLocal(messageID, msgSecret)
-			useKey = msgSecret
-		} else {
-			encCiphertext, encIV, _ = encryptMediaRetryReceiptLocal(messageID, mediaKey)
-			useKey = mediaKey
-		}
-
-		var retryContent []waBinary.Node
-		if encCiphertext != nil {
-			retryContent = []waBinary.Node{
-				{Tag: "encrypt", Content: []waBinary.Node{
-					{Tag: "enc_p", Content: encCiphertext},
-					{Tag: "enc_iv", Content: encIV},
-				}},
-				{Tag: "rmr", Attrs: waBinary.Attrs{
-					"jid":         parsedEvt.Info.Chat,
-					"from_me":     parsedEvt.Info.IsFromMe,
-					"participant": parsedEvt.Info.Sender,
-				}},
-			}
-		} else {
-			retryContent = []waBinary.Node{
-				{Tag: "rmr", Attrs: waBinary.Attrs{
-					"jid":         parsedEvt.Info.Chat,
-					"from_me":     parsedEvt.Info.IsFromMe,
-					"participant": parsedEvt.Info.Sender,
-				}},
-			}
-		}
-
-		retryStanza := waBinary.Node{
-			Tag: "receipt",
-			Attrs: waBinary.Attrs{
-				"id":   messageID,
-				"to":   ownID,
-				"type": "server-error",
-			},
-			Content: retryContent,
-		}
-
-		keyType := "mediaKey"
-		if len(useKey) > 0 && msgSecret != nil && useKey != nil {
-			// Compare with mediaKey to determine which key we're using
-			if string(useKey) != string(mediaKey) {
-				keyType = "messageSecret"
-			}
-		}
-		fmt.Printf("Sending MediaRetry (%s): chat=%s, participant=%s, id=%s\n",
-			keyType, parsedEvt.Info.Chat.String(), parsedEvt.Info.Sender.String(), messageID)
-
-		retryErr := client.DangerousInternals().SendNode(context.Background(), retryStanza)
+		retryErr := client.SendMediaRetryReceipt(context.Background(), &retryInfo, mediaKey)
 		if retryErr != nil {
 			mediaRetryCacheLock.Lock()
 			delete(mediaRetryCache, messageID)
@@ -1350,7 +1302,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Handler for QR pairing page (auto-refresh)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/qr" || r.URL.Path == "/login/status" ||
-			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" {
+			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" || r.URL.Path == "/api/resend" || r.URL.Path == "/api/mediaconn" {
 			// Let other handlers deal with these paths
 			return
 		}
@@ -1438,6 +1390,83 @@ document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script
 	})
 
 	// Handler for downloading media
+	// Handler for getting media connection info (for debugging)
+	http.HandleFunc("/api/mediaconn", func(w http.ResponseWriter, r *http.Request) {
+		mc, err := client.DangerousInternals().RefreshMediaConn(context.Background(), true)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+		hosts := make([]string, len(mc.Hosts))
+		for i, h := range mc.Hosts {
+			hosts[i] = h.Hostname
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"auth":    mc.Auth,
+			"authTTL": mc.AuthTTL,
+			"ttl":     mc.TTL,
+			"hosts":   hosts,
+		})
+	})
+
+	// Handler for PlaceholderMessageResend (fresh message with fresh URLs)
+	http.HandleFunc("/api/resend", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID    string `json:"chat_jid"`
+			MessageID  string `json:"message_id"`
+			SenderPN   string `json:"sender_pn"` // Optional: phone number JID
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+
+		chatJID, _ := types.ParseJID(req.ChatJID)
+		var senderJID types.JID
+		if req.SenderPN != "" {
+			senderJID, _ = types.ParseJID(req.SenderPN)
+		} else {
+			// Try to get sender from message store
+			senderJID = chatJID
+		}
+
+		// Build PlaceholderMessageResend request with explicit participant
+		msgKey := &waCommon.MessageKey{
+			FromMe:    proto.Bool(false),
+			ID:        proto.String(req.MessageID),
+			RemoteJID: proto.String(req.ChatJID),
+		}
+		if !senderJID.IsEmpty() {
+			msgKey.Participant = proto.String(senderJID.ToNonAD().String())
+		}
+
+		resendMsg := &waE2E.Message{
+			ProtocolMessage: &waE2E.ProtocolMessage{
+				Type: waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_MESSAGE.Enum(),
+				PeerDataOperationRequestMessage: &waE2E.PeerDataOperationRequestMessage{
+					PeerDataOperationRequestType: waE2E.PeerDataOperationRequestType_PLACEHOLDER_MESSAGE_RESEND.Enum(),
+					PlaceholderMessageResendRequest: []*waE2E.PeerDataOperationRequestMessage_PlaceholderMessageResendRequest{{
+						MessageKey: msgKey,
+					}},
+				},
+			},
+		}
+
+		fmt.Printf("Sending PlaceholderMessageResend: chat=%s, id=%s, participant=%s\n",
+			req.ChatJID, req.MessageID, senderJID.String())
+
+		_, err := client.SendPeerMessage(context.Background(), resendMsg)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("send failed: %v", err)})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "resend request sent"})
+	})
+
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
