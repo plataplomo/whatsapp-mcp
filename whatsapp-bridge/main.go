@@ -739,7 +739,13 @@ type retryResult struct {
 // DirectPath is updated, then cli.Download(msg) is called — which
 // verifies file integrity via SHA256.
 func handleMediaRetryEvent(evt *events.MediaRetry, logger waLog.Logger) {
-	fmt.Printf("MediaRetry event received: id=%s, chat=%s, fromMe=%v\n", evt.MessageID, evt.ChatID.String(), evt.FromMe)
+	if evt.Error != nil {
+		fmt.Printf("MediaRetry event received: id=%s, chat=%s, fromMe=%v, ERROR code=%d\n",
+			evt.MessageID, evt.ChatID.String(), evt.FromMe, evt.Error.Code)
+	} else {
+		fmt.Printf("MediaRetry event received: id=%s, chat=%s, fromMe=%v, sender=%s, ciphertext=%d bytes\n",
+			evt.MessageID, evt.ChatID.String(), evt.FromMe, evt.SenderID.String(), len(evt.Ciphertext))
+	}
 	mediaRetryCacheLock.Lock()
 	pending, ok := mediaRetryCache[evt.MessageID]
 	mediaRetryCacheLock.Unlock()
@@ -871,19 +877,9 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 		mediaRetryCacheLock.Unlock()
 
 		// Step 6: Send MediaRetryReceipt with the correct parsed MessageInfo.
-		// Resolve LID → phone number JID if the sender is LID-addressed.
-		// WhatsApp servers need s.whatsapp.net JIDs for MediaRetry participant,
-		// not LIDs (group.go does the same for group operations).
+		// Keep the original sender JID from ParseWebMessage (LID or PN).
+		// ParseWebMessage extracts the participant from the proto itself.
 		retryInfo := parsedEvt.Info
-		if retryInfo.IsGroup && retryInfo.Sender.Server == types.HiddenUserServer {
-			pn, lidErr := client.Store.LIDs.GetPNForLID(context.Background(), retryInfo.Sender)
-			if lidErr == nil && !pn.IsEmpty() {
-				fmt.Printf("Resolved LID %s → PN %s\n", retryInfo.Sender.String(), pn.String())
-				retryInfo.Sender = pn
-			} else {
-				fmt.Printf("Warning: could not resolve LID %s: %v\n", retryInfo.Sender.String(), lidErr)
-			}
-		}
 
 		fmt.Printf("Sending MediaRetry: chat=%s, sender=%s, id=%s, isFromMe=%v, isGroup=%v\n",
 			retryInfo.Chat.String(), retryInfo.Sender.String(),
