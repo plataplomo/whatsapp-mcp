@@ -1302,7 +1302,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Handler for QR pairing page (auto-refresh)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/qr" || r.URL.Path == "/login/status" ||
-			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" || r.URL.Path == "/api/resend" || r.URL.Path == "/api/mediaconn" || r.URL.Path == "/api/mediaretry" || r.URL.Path == "/api/histsyncerror" {
+			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" || r.URL.Path == "/api/resend" || r.URL.Path == "/api/mediaconn" || r.URL.Path == "/api/mediaretry" || r.URL.Path == "/api/histsyncerror" || r.URL.Path == "/api/mediaretry-lid" {
 			// Let other handlers deal with these paths
 			return
 		}
@@ -1390,6 +1390,122 @@ document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script
 	})
 
 	// Handler for downloading media
+	// Handler for MediaRetry using LID instead of PN (matching WhatsApp Web behavior)
+	http.HandleFunc("/api/mediaretry-lid", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID   string `json:"chat_jid"`
+			MessageID string `json:"message_id"`
+			Sender    string `json:"sender"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+
+		chatJID, _ := types.ParseJID(req.ChatJID)
+		senderJID, _ := types.ParseJID(req.Sender)
+
+		// Get mediaKey
+		_, _, _, mediaKey, _, _, _, pErr := messageStore.GetMediaInfo(req.MessageID, req.ChatJID)
+		if pErr != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("failed to get media key: %v", pErr)})
+			return
+		}
+
+		// Get own LID (not PN!) - this is what WhatsApp Web does
+		ownLID := client.DangerousInternals().GetOwnLID().ToNonAD()
+		if ownLID.IsEmpty() {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "no LID available"})
+			return
+		}
+		fmt.Printf("MediaRetry-LID: ownLID=%s (instead of PN), chat=%s, sender=%s, id=%s\n",
+			ownLID.String(), req.ChatJID, senderJID.String(), req.MessageID)
+
+		// Encrypt the receipt
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				Sender:   senderJID,
+				IsFromMe: false,
+				IsGroup:  strings.Contains(req.ChatJID, "@g.us"),
+			},
+			ID: req.MessageID,
+		}
+
+		// Set up media retry cache
+		resultChan := make(chan *retryResult, 1)
+		mediaRetryCacheLock.Lock()
+		mediaRetryCache[req.MessageID] = &pendingMediaRetry{
+			MessageID: req.MessageID,
+			ChatJID:   req.ChatJID,
+			MediaKey:  mediaKey,
+			Result:    resultChan,
+		}
+		mediaRetryCacheLock.Unlock()
+
+		// Build the receipt MANUALLY with to=LID
+		// Replicate whatsmeow's SendMediaRetryReceipt but with ownLID
+		ciphertext, iv, encErr := encryptMediaRetryReceiptLocal(req.MessageID, mediaKey)
+		if encErr != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("encrypt failed: %v", encErr)})
+			return
+		}
+
+		rmrAttrs := waBinary.Attrs{
+			"jid":     chatJID,
+			"from_me": false,
+		}
+		if msgInfo.IsGroup {
+			rmrAttrs["participant"] = senderJID
+		}
+
+		sendErr := client.DangerousInternals().SendNode(context.Background(), waBinary.Node{
+			Tag: "receipt",
+			Attrs: waBinary.Attrs{
+				"id":   req.MessageID,
+				"to":   ownLID, // LID instead of PN!
+				"type": "server-error",
+			},
+			Content: []waBinary.Node{
+				{Tag: "encrypt", Content: []waBinary.Node{
+					{Tag: "enc_p", Content: ciphertext},
+					{Tag: "enc_iv", Content: iv},
+				}},
+				{Tag: "rmr", Attrs: rmrAttrs},
+			},
+		})
+
+		if sendErr != nil {
+			mediaRetryCacheLock.Lock()
+			delete(mediaRetryCache, req.MessageID)
+			mediaRetryCacheLock.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("send failed: %v", sendErr)})
+			return
+		}
+
+		// Wait for response
+		select {
+		case result := <-resultChan:
+			mediaRetryCacheLock.Lock()
+			delete(mediaRetryCache, req.MessageID)
+			mediaRetryCacheLock.Unlock()
+			if result.Error != nil {
+				json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("retry error: %v", result.Error)})
+			} else {
+				json.NewEncoder(w).Encode(map[string]any{"success": true, "direct_path": result.DirectPath})
+			}
+		case <-time.After(30 * time.Second):
+			mediaRetryCacheLock.Lock()
+			delete(mediaRetryCache, req.MessageID)
+			mediaRetryCacheLock.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "timeout"})
+		}
+	})
+
 	// Handler for SendHistorySyncServerErrorReceipt
 	http.HandleFunc("/api/histsyncerror", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
