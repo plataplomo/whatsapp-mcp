@@ -7,3 +7,8 @@ whatsapp-bridge/whatsapp-bridge
 # Data
 whatsapp-bridge/store/
 store/
+store_backup_*/
+store/*.db
+store/*.db-*
+store/*@g.us/
+store/*@s.whatsapp.net/

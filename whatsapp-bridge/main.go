@@ -1302,7 +1302,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Handler for QR pairing page (auto-refresh)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/qr" || r.URL.Path == "/login/status" ||
-			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" || r.URL.Path == "/api/resend" || r.URL.Path == "/api/mediaconn" || r.URL.Path == "/api/mediaretry" {
+			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" || r.URL.Path == "/api/resend" || r.URL.Path == "/api/mediaconn" || r.URL.Path == "/api/mediaretry" || r.URL.Path == "/api/histsyncerror" {
 			// Let other handlers deal with these paths
 			return
 		}
@@ -1390,6 +1390,35 @@ document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script
 	})
 
 	// Handler for downloading media
+	// Handler for SendHistorySyncServerErrorReceipt
+	http.HandleFunc("/api/histsyncerror", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID   string `json:"chat_jid"`
+			MessageID string `json:"message_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+
+		_, _, _, mediaKey, _, _, _, pErr := messageStore.GetMediaInfo(req.MessageID, req.ChatJID)
+		if pErr != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("failed to get media key: %v", pErr)})
+			return
+		}
+
+		err := client.SendHistorySyncServerErrorReceipt(context.Background(), types.MessageID(req.MessageID), mediaKey)
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("send failed: %v", err)})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "history sync server error receipt sent"})
+	})
+
 	// Handler for manual MediaRetry test
 	http.HandleFunc("/api/mediaretry", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
