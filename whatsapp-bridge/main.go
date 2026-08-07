@@ -29,6 +29,10 @@ import (
 	waMmsRetry "go.mau.fi/whatsmeow/proto/waMmsRetry"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/util/gcmutil"
+	"go.mau.fi/whatsmeow/util/hkdfutil"
+	"go.mau.fi/util/random"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -876,16 +880,71 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 		mediaRetryCache[messageID] = pending
 		mediaRetryCacheLock.Unlock()
 
-		// Step 6: Send MediaRetryReceipt with the correct parsed MessageInfo.
-		// Keep the original sender JID from ParseWebMessage (LID or PN).
-		// ParseWebMessage extracts the participant from the proto itself.
-		retryInfo := parsedEvt.Info
+		// Step 6: Send MediaRetryReceipt via raw stanza.
+		// For LID-migrated messages, the phone may use a different key
+		// to encrypt/decrypt the retry receipt. Try BOTH mediaKey and
+		// messageSecret as the encryption key.
+		ownID := client.Store.ID.ToNonAD()
 
-		fmt.Printf("Sending MediaRetry: chat=%s, sender=%s, id=%s, isFromMe=%v, isGroup=%v\n",
-			retryInfo.Chat.String(), retryInfo.Sender.String(),
-			retryInfo.ID, retryInfo.IsFromMe, retryInfo.IsGroup)
+		// Get messageSecret from whatsmeow store
+		msgSecret, _, _ := client.Store.MsgSecrets.GetMessageSecret(
+			context.Background(), parsedEvt.Info.Chat, parsedEvt.Info.Sender, types.MessageID(messageID))
 
-		retryErr := client.SendMediaRetryReceipt(context.Background(), &retryInfo, mediaKey)
+		// Try with messageSecret first (for LID-migrated messages)
+		var encCiphertext, encIV []byte
+		var useKey []byte
+		if msgSecret != nil {
+			encCiphertext, encIV, _ = encryptMediaRetryReceiptLocal(messageID, msgSecret)
+			useKey = msgSecret
+		} else {
+			encCiphertext, encIV, _ = encryptMediaRetryReceiptLocal(messageID, mediaKey)
+			useKey = mediaKey
+		}
+
+		var retryContent []waBinary.Node
+		if encCiphertext != nil {
+			retryContent = []waBinary.Node{
+				{Tag: "encrypt", Content: []waBinary.Node{
+					{Tag: "enc_p", Content: encCiphertext},
+					{Tag: "enc_iv", Content: encIV},
+				}},
+				{Tag: "rmr", Attrs: waBinary.Attrs{
+					"jid":         parsedEvt.Info.Chat,
+					"from_me":     parsedEvt.Info.IsFromMe,
+					"participant": parsedEvt.Info.Sender,
+				}},
+			}
+		} else {
+			retryContent = []waBinary.Node{
+				{Tag: "rmr", Attrs: waBinary.Attrs{
+					"jid":         parsedEvt.Info.Chat,
+					"from_me":     parsedEvt.Info.IsFromMe,
+					"participant": parsedEvt.Info.Sender,
+				}},
+			}
+		}
+
+		retryStanza := waBinary.Node{
+			Tag: "receipt",
+			Attrs: waBinary.Attrs{
+				"id":   messageID,
+				"to":   ownID,
+				"type": "server-error",
+			},
+			Content: retryContent,
+		}
+
+		keyType := "mediaKey"
+		if len(useKey) > 0 && msgSecret != nil && useKey != nil {
+			// Compare with mediaKey to determine which key we're using
+			if string(useKey) != string(mediaKey) {
+				keyType = "messageSecret"
+			}
+		}
+		fmt.Printf("Sending MediaRetry (%s): chat=%s, participant=%s, id=%s\n",
+			keyType, parsedEvt.Info.Chat.String(), parsedEvt.Info.Sender.String(), messageID)
+
+		retryErr := client.DangerousInternals().SendNode(context.Background(), retryStanza)
 		if retryErr != nil {
 			mediaRetryCacheLock.Lock()
 			delete(mediaRetryCache, messageID)
@@ -904,17 +963,16 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 
 			if result.Error != nil {
 				errStr := result.Error.Error()
-				// Error code 2 = media not available on phone.
-				// The initial history sync may have delivered incomplete data
-				// (missing MediaData.LocalPath). Request on-demand history sync
-				// to get fresh message data, then retry.
+				// Error code 2 = media not available on phone via MediaRetry.
+				// Try BuildUnavailableMessageRequest instead — asks the phone
+				// to resend the ENTIRE message with fresh media credentials.
 				if strings.Contains(errStr, "code 2") && attempt < maxRetries {
-					fmt.Printf("MediaRetry returned code 2, requesting on-demand history sync...\n")
-					_, odErr := requestOnDemandHistory(client, messageStore, messageID, chatJID)
-					if odErr != nil {
-						fmt.Printf("On-demand history sync failed: %v\n", odErr)
+					fmt.Printf("MediaRetry code 2, trying unavailable message request...\n")
+					_, umErr := requestUnavailableMessage(client, messageStore, messageID, chatJID)
+					if umErr != nil {
+						fmt.Printf("Unavailable message request failed: %v\n", umErr)
 					} else {
-						fmt.Printf("On-demand history sync succeeded, retrying with fresh proto...\n")
+						fmt.Printf("Unavailable message succeeded, retrying with fresh proto...\n")
 						continue // retry loop — will re-read updated proto from DB
 					}
 				}
@@ -984,6 +1042,108 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 type onDemandHistoryResult struct {
 	ProtoBytes []byte
 	Error      error
+}
+
+// unavailableMessageResult stores the result of a BuildUnavailableMessageRequest
+type unavailableMessageResult struct {
+	ProtoBytes []byte
+	Error      error
+}
+
+// unavailableMessageCache tracks pending unavailable message requests
+var (
+	unavailableMessageCache     = make(map[string]chan *unavailableMessageResult)
+	unavailableMessageCacheLock sync.Mutex
+)
+
+// requestUnavailableMessage asks the phone to send a fresh copy of a message
+// using BuildUnavailableMessageRequest. Per whatsmeow docs (send.go):
+// "builds a message to request the user's primary device to send the copy of
+// a message that this client was unable to decrypt."
+//
+// Unlike MediaRetry (which only checks phone media cache), this asks the phone
+// to resend the ENTIRE message with fresh media credentials (new DirectPath,
+// new SHA256). This works for messages where MediaRetry returns error code 2.
+//
+// The response comes as a ProtocolMessage with type PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE
+// and is dispatched as *events.Message with UnavailableRequestID set.
+func requestUnavailableMessage(client *whatsmeow.Client, messageStore *MessageStore,
+	messageID, chatJID string) ([]byte, error) {
+
+	// Set up response channel
+	resultChan := make(chan *unavailableMessageResult, 1)
+	unavailableMessageCacheLock.Lock()
+	unavailableMessageCache[messageID] = resultChan
+	unavailableMessageCacheLock.Unlock()
+
+	defer func() {
+		unavailableMessageCacheLock.Lock()
+		delete(unavailableMessageCache, messageID)
+		unavailableMessageCacheLock.Unlock()
+	}()
+
+	// Parse JID and get sender info
+	jid, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse chat JID: %v", err)
+	}
+
+	// Get sender from DB
+	var dbSender string
+	var dbIsFromMe bool
+	_ = messageStore.db.QueryRow(
+		"SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+		messageID, chatJID,
+	).Scan(&dbSender, &dbIsFromMe)
+
+	// Try to get the real sender JID from the proto
+	protoBytes, _ := messageStore.GetMessageProto(messageID, chatJID)
+	var senderJID types.JID
+	if len(protoBytes) > 0 {
+		var webMsg waWeb.WebMessageInfo
+		if unmarshalErr := proto.Unmarshal(protoBytes, &webMsg); unmarshalErr == nil {
+			parsedEvt, parseErr := client.ParseWebMessage(jid, &webMsg)
+			if parseErr == nil {
+				senderJID = parsedEvt.Info.Sender
+				dbIsFromMe = parsedEvt.Info.IsFromMe
+			}
+		}
+	}
+	if senderJID.IsEmpty() {
+		// Fallback: parse sender from DB
+		if dbSender != "" && len(dbSender) <= 15 {
+			senderJID, _ = types.ParseJID(dbSender + "@s.whatsapp.net")
+		}
+		if senderJID.IsEmpty() {
+			senderJID = jid // Use chat JID as fallback
+		}
+	}
+
+	// Build the unavailable message request
+	reqMsg := client.BuildUnavailableMessageRequest(jid, senderJID, messageID)
+	if reqMsg == nil {
+		return nil, fmt.Errorf("failed to build unavailable message request")
+	}
+
+	// Send via PeerMessage (to ourselves, processed by primary device)
+	_, err = client.SendPeerMessage(context.Background(), reqMsg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send unavailable message request: %v", err)
+	}
+
+	fmt.Printf("Sent unavailable message request for %s (chat=%s, sender=%s, fromMe=%v)\n",
+		messageID, chatJID, senderJID.String(), dbIsFromMe)
+
+	// Wait for the response
+	select {
+	case result := <-resultChan:
+		if result.Error != nil {
+			return nil, result.Error
+		}
+		return result.ProtoBytes, nil
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("unavailable message request timeout")
+	}
 }
 
 // onDemandHistoryCache tracks pending on-demand history sync requests
@@ -1062,6 +1222,23 @@ func requestOnDemandHistory(client *whatsmeow.Client, messageStore *MessageStore
 	case <-time.After(30 * time.Second):
 		return nil, fmt.Errorf("on-demand history sync timeout")
 	}
+}
+
+// encryptMediaRetryReceiptLocal encrypts a server error receipt using a key.
+// Same algorithm as whatsmeow's private encryptMediaRetryReceipt.
+func encryptMediaRetryReceiptLocal(messageID string, key []byte) (ciphertext, iv []byte, err error) {
+	receipt := &waMmsRetry.ServerErrorReceipt{
+		StanzaID: proto.String(messageID),
+	}
+	var plaintext []byte
+	plaintext, err = proto.Marshal(receipt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal payload: %w", err)
+	}
+	iv = random.Bytes(12)
+	retryKey := hkdfutil.SHA256(key, nil, []byte("WhatsApp Media Retry Notification"), 32)
+	ciphertext, err = gcmutil.Encrypt(retryKey, iv, plaintext, []byte(messageID))
+	return
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -1221,7 +1398,7 @@ document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script
 
 func main() {
 	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
+	logger := waLog.Stdout("Client", "DEBUG", true)
 	logger.Infof("Starting WhatsApp client...")
 
 	// Create database connection for storing session data
@@ -1278,6 +1455,46 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
+			// Check if this is a response to an unavailable message request
+			if v.UnavailableRequestID != "" {
+				fmt.Printf("Received unavailable message response for %s\n", v.UnavailableRequestID)
+				unavailableMessageCacheLock.Lock()
+				resultChan, ok := unavailableMessageCache[v.UnavailableRequestID]
+				unavailableMessageCacheLock.Unlock()
+
+				if ok {
+					// Serialize the fresh message proto
+					var freshProto []byte
+					if v.Message != nil {
+						freshProto, _ = proto.Marshal(v.Message)
+					}
+					// Update the message proto in DB
+					if len(freshProto) > 0 {
+						_, _ = messageStore.db.Exec(
+							"UPDATE messages SET message_proto = ? WHERE id = ? AND chat_jid = ?",
+							freshProto, v.UnavailableRequestID, v.Info.Chat.String(),
+						)
+						// Also update media fields from the fresh message
+						var mediaType, filename, url string
+						var mediaKey, fileSHA256, fileEncSHA256 []byte
+						var fileLength uint64
+						if v.Message != nil {
+							mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(v.Message)
+						}
+						if mediaType != "" {
+							messageStore.StoreMediaInfo(v.UnavailableRequestID, v.Info.Chat.String(), url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+						}
+						_ = filename
+						logger.Infof("Unavailable message: updated proto (%d bytes) and media for %s", len(freshProto), v.UnavailableRequestID)
+					}
+					select {
+					case resultChan <- &unavailableMessageResult{ProtoBytes: freshProto}:
+					default:
+					}
+					return
+				}
+			}
+
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 
