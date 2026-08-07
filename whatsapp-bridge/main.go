@@ -1302,7 +1302,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Handler for QR pairing page (auto-refresh)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/qr" || r.URL.Path == "/login/status" ||
-			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" || r.URL.Path == "/api/resend" || r.URL.Path == "/api/mediaconn" {
+			r.URL.Path == "/api/send" || r.URL.Path == "/api/download" || r.URL.Path == "/api/resend" || r.URL.Path == "/api/mediaconn" || r.URL.Path == "/api/mediaretry" {
 			// Let other handlers deal with these paths
 			return
 		}
@@ -1390,6 +1390,90 @@ document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script
 	})
 
 	// Handler for downloading media
+	// Handler for manual MediaRetry test
+	http.HandleFunc("/api/mediaretry", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID   string `json:"chat_jid"`
+			MessageID string `json:"message_id"`
+			Sender    string `json:"sender"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+
+		chatJID, _ := types.ParseJID(req.ChatJID)
+		senderJID, _ := types.ParseJID(req.Sender)
+
+		// Get mediaKey from message store
+		mediaType, filename, url, mediaKey, fileSHA, fileEncSHA, fileLength, pErr := messageStore.GetMediaInfo(req.MessageID, req.ChatJID)
+		if pErr != nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("failed to get media info: %v", pErr)})
+			return
+		}
+		_ = url
+		_ = fileSHA
+		_ = fileEncSHA
+		_ = fileLength
+		_ = mediaType
+		_ = filename
+
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				Sender:   senderJID,
+				IsFromMe: false,
+				IsGroup:  strings.Contains(req.ChatJID, "@g.us"),
+			},
+			ID: req.MessageID,
+		}
+
+		// Set up media retry cache
+		resultChan := make(chan *retryResult, 1)
+		mediaRetryCacheLock.Lock()
+		mediaRetryCache[req.MessageID] = &pendingMediaRetry{
+			MessageID: req.MessageID,
+			ChatJID:   req.ChatJID,
+			MediaKey:  mediaKey,
+			Result:    resultChan,
+		}
+		mediaRetryCacheLock.Unlock()
+
+		fmt.Printf("Manual MediaRetry: chat=%s, sender=%s, id=%s\n",
+			req.ChatJID, senderJID.String(), req.MessageID)
+
+		retryErr := client.SendMediaRetryReceipt(context.Background(), msgInfo, mediaKey)
+		if retryErr != nil {
+			mediaRetryCacheLock.Lock()
+			delete(mediaRetryCache, req.MessageID)
+			mediaRetryCacheLock.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("send failed: %v", retryErr)})
+			return
+		}
+
+		// Wait for response
+		select {
+		case result := <-resultChan:
+			mediaRetryCacheLock.Lock()
+			delete(mediaRetryCache, req.MessageID)
+			mediaRetryCacheLock.Unlock()
+			if result.Error != nil {
+				json.NewEncoder(w).Encode(map[string]any{"success": false, "message": fmt.Sprintf("retry error: %v", result.Error)})
+			} else {
+				json.NewEncoder(w).Encode(map[string]any{"success": true, "direct_path": result.DirectPath})
+			}
+		case <-time.After(30 * time.Second):
+			mediaRetryCacheLock.Lock()
+			delete(mediaRetryCache, req.MessageID)
+			mediaRetryCacheLock.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "timeout"})
+		}
+	})
+
 	// Handler for getting media connection info (for debugging)
 	http.HandleFunc("/api/mediaconn", func(w http.ResponseWriter, r *http.Request) {
 		mc, err := client.DangerousInternals().RefreshMediaConn(context.Background(), true)
