@@ -27,6 +27,7 @@ import (
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waMmsRetry "go.mau.fi/whatsmeow/proto/waMmsRetry"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -869,12 +870,26 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 		mediaRetryCache[messageID] = pending
 		mediaRetryCacheLock.Unlock()
 
-		// Step 6: Send MediaRetryReceipt with the correct parsed MessageInfo
-		fmt.Printf("Sending MediaRetry: chat=%s, sender=%s, id=%s, isFromMe=%v, isGroup=%v\n",
-			parsedEvt.Info.Chat.String(), parsedEvt.Info.Sender.String(),
-			parsedEvt.Info.ID, parsedEvt.Info.IsFromMe, parsedEvt.Info.IsGroup)
+		// Step 6: Send MediaRetryReceipt with the correct parsed MessageInfo.
+		// Resolve LID → phone number JID if the sender is LID-addressed.
+		// WhatsApp servers need s.whatsapp.net JIDs for MediaRetry participant,
+		// not LIDs (group.go does the same for group operations).
+		retryInfo := parsedEvt.Info
+		if retryInfo.IsGroup && retryInfo.Sender.Server == types.HiddenUserServer {
+			pn, lidErr := client.Store.LIDs.GetPNForLID(context.Background(), retryInfo.Sender)
+			if lidErr == nil && !pn.IsEmpty() {
+				fmt.Printf("Resolved LID %s → PN %s\n", retryInfo.Sender.String(), pn.String())
+				retryInfo.Sender = pn
+			} else {
+				fmt.Printf("Warning: could not resolve LID %s: %v\n", retryInfo.Sender.String(), lidErr)
+			}
+		}
 
-		retryErr := client.SendMediaRetryReceipt(context.Background(), &parsedEvt.Info, mediaKey)
+		fmt.Printf("Sending MediaRetry: chat=%s, sender=%s, id=%s, isFromMe=%v, isGroup=%v\n",
+			retryInfo.Chat.String(), retryInfo.Sender.String(),
+			retryInfo.ID, retryInfo.IsFromMe, retryInfo.IsGroup)
+
+		retryErr := client.SendMediaRetryReceipt(context.Background(), &retryInfo, mediaKey)
 		if retryErr != nil {
 			mediaRetryCacheLock.Lock()
 			delete(mediaRetryCache, messageID)
@@ -892,6 +907,21 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 			mediaRetryCacheLock.Unlock()
 
 			if result.Error != nil {
+				errStr := result.Error.Error()
+				// Error code 2 = media not available on phone.
+				// The initial history sync may have delivered incomplete data
+				// (missing MediaData.LocalPath). Request on-demand history sync
+				// to get fresh message data, then retry.
+				if strings.Contains(errStr, "code 2") && attempt < maxRetries {
+					fmt.Printf("MediaRetry returned code 2, requesting on-demand history sync...\n")
+					_, odErr := requestOnDemandHistory(client, messageStore, messageID, chatJID)
+					if odErr != nil {
+						fmt.Printf("On-demand history sync failed: %v\n", odErr)
+					} else {
+						fmt.Printf("On-demand history sync succeeded, retrying with fresh proto...\n")
+						continue // retry loop — will re-read updated proto from DB
+					}
+				}
 				return false, mediaType, filename, "", result.Error
 			}
 
@@ -952,6 +982,90 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 	}
 
 	return false, "", "", "", fmt.Errorf("max retries exceeded")
+}
+
+// onDemandHistoryResult stores the result of an on-demand history sync
+type onDemandHistoryResult struct {
+	ProtoBytes []byte
+	Error      error
+}
+
+// onDemandHistoryCache tracks pending on-demand history sync requests
+var (
+	onDemandHistoryCache     = make(map[string]chan *onDemandHistoryResult)
+	onDemandHistoryCacheLock sync.Mutex
+)
+
+// requestOnDemandHistory requests fresh message data from the phone for a
+// specific chat via BuildHistorySyncRequest. This is used when MediaRetry
+// returns error code 2 (media not available) — the initial history sync
+// may have delivered incomplete data (missing MediaData.LocalPath).
+//
+// Per whatsmeow docs (send.go): "The response will come as an *events.HistorySync
+// with type ON_DEMAND. The response will contain `count` messages immediately
+// before the given message."
+func requestOnDemandHistory(client *whatsmeow.Client, messageStore *MessageStore,
+	messageID, chatJID string) ([]byte, error) {
+
+	// Set up response channel
+	resultChan := make(chan *onDemandHistoryResult, 1)
+	onDemandHistoryCacheLock.Lock()
+	onDemandHistoryCache[chatJID] = resultChan
+	onDemandHistoryCacheLock.Unlock()
+
+	defer func() {
+		onDemandHistoryCacheLock.Lock()
+		delete(onDemandHistoryCache, chatJID)
+		onDemandHistoryCacheLock.Unlock()
+	}()
+
+	// Build the on-demand request for messages around the target
+	jid, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse JID: %v", err)
+	}
+
+	// Get timestamp of the target message
+	var msgTimestamp time.Time
+	var msgIsFromMe bool
+	_ = messageStore.db.QueryRow(
+		"SELECT timestamp, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+		messageID, chatJID,
+	).Scan(&msgTimestamp, &msgIsFromMe)
+
+	msgInfo := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     jid,
+			IsFromMe: msgIsFromMe,
+			IsGroup:  strings.Contains(chatJID, "@g.us"),
+		},
+		ID:        messageID,
+		Timestamp: msgTimestamp,
+	}
+
+	// Build and send on-demand history sync request
+	historyMsg := client.BuildHistorySyncRequest(msgInfo, 50)
+	if historyMsg == nil {
+		return nil, fmt.Errorf("failed to build history sync request")
+	}
+
+	_, err = client.SendPeerMessage(context.Background(), historyMsg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send on-demand history request: %v", err)
+	}
+
+	fmt.Printf("Sent on-demand history sync for chat %s (around msg %s)\n", chatJID, messageID)
+
+	// Wait for the response
+	select {
+	case result := <-resultChan:
+		if result.Error != nil {
+			return nil, result.Error
+		}
+		return result.ProtoBytes, nil
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("on-demand history sync timeout")
+	}
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -1068,7 +1182,7 @@ document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script
 		}
 
 		// Download the media (with automatic media retry for expired URLs)
-		success, mediaType, filename, path, err := downloadWithRetry(client, messageStore, req.MessageID, req.ChatJID, 1)
+		success, mediaType, filename, path, err := downloadWithRetry(client, messageStore, req.MessageID, req.ChatJID, 2)
 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1348,6 +1462,84 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
+	// Check for ON_DEMAND history sync (response to requestOnDemandHistory)
+	syncType := historySync.Data.GetSyncType()
+	if syncType == waHistorySync.HistorySync_ON_DEMAND {
+		fmt.Printf("Received ON_DEMAND history sync with %d conversations\n", len(historySync.Data.Conversations))
+
+		// Find the chat we requested and extract updated proto data
+		for _, conversation := range historySync.Data.Conversations {
+			if conversation.ID == nil {
+				continue
+			}
+			chatJID := *conversation.ID
+
+			// Notify the waiting requestOnDemandHistory caller
+			onDemandHistoryCacheLock.Lock()
+			resultChan, ok := onDemandHistoryCache[chatJID]
+			onDemandHistoryCacheLock.Unlock()
+
+			if !ok {
+				continue
+			}
+
+			// Extract the first message proto (should contain our target message)
+			for _, msg := range conversation.Messages {
+				if msg == nil || msg.Message == nil {
+					continue
+				}
+				protoBytes, mErr := proto.Marshal(msg.Message)
+				if mErr != nil {
+					continue
+				}
+
+				// Get message ID
+				var msgID string
+				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
+					msgID = *msg.Message.Key.ID
+				}
+
+				// Update the proto in the DB
+				_, _ = messageStore.db.Exec(
+					"UPDATE messages SET message_proto = ? WHERE id = ? AND chat_jid = ?",
+					protoBytes, msgID, chatJID,
+				)
+
+				// Also update media fields if present
+				var mediaType, filename, url string
+				var mediaKey, fileSHA256, fileEncSHA256 []byte
+				var fileLength uint64
+				if msg.Message.Message != nil {
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+				}
+				_ = filename // already in proto
+				if mediaType != "" {
+					messageStore.StoreMediaInfo(msgID, chatJID, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+				}
+
+				logger.Infof("ON_DEMAND: updated proto for %s in %s", msgID, chatJID)
+			}
+
+			// Send result to the waiting caller
+			select {
+			case resultChan <- &onDemandHistoryResult{Error: nil}:
+			default:
+			}
+			return
+		}
+
+		// Chat not found in the response
+		onDemandHistoryCacheLock.Lock()
+		for chatJID, resultChan := range onDemandHistoryCache {
+			select {
+			case resultChan <- &onDemandHistoryResult{Error: fmt.Errorf("chat %s not found in on-demand response", chatJID)}:
+			default:
+			}
+		}
+		onDemandHistoryCacheLock.Unlock()
+		return
+	}
+
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
 	syncedCount := 0
