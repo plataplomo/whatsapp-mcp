@@ -27,6 +27,7 @@ import (
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waMmsRetry "go.mau.fi/whatsmeow/proto/waMmsRetry"
+	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -87,6 +88,7 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			message_proto BLOB,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -95,6 +97,9 @@ func NewMessageStore() (*MessageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
+
+	// Migration: add message_proto column if it doesn't exist (for existing DBs)
+	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN message_proto BLOB")
 
 	return &MessageStore{db: db}, nil
 }
@@ -115,19 +120,29 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, messageProto []byte) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, message_proto)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, messageProto,
 	)
 	return err
+}
+
+// GetMessageProto retrieves the serialized WebMessageInfo proto for a message
+func (store *MessageStore) GetMessageProto(id, chatJID string) ([]byte, error) {
+	var proto []byte
+	err := store.db.QueryRow(
+		"SELECT message_proto FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	).Scan(&proto)
+	return proto, err
 }
 
 // Get messages from a chat
@@ -441,6 +456,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	// Store message in database
+	// Serialize the message for potential MediaRetry later
+	var msgProtoBytes []byte
+	if msg.Message != nil {
+		msgProtoBytes, _ = proto.Marshal(msg.Message)
+	}
+
 	err = messageStore.StoreMessage(
 		msg.Info.ID,
 		chatJID,
@@ -455,6 +476,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		msgProtoBytes,
 	)
 
 	if err != nil {
@@ -705,13 +727,16 @@ type pendingMediaRetry struct {
 
 type retryResult struct {
 	DirectPath string
-	URL        string
 	Error      error
 }
 
 // handleMediaRetryEvent processes the response from the phone after
 // SendMediaRetryReceipt was sent. The phone re-uploads the media and
 // returns a new direct path.
+//
+// Per whatsmeow docs (mediaretry.go): the cached message object's
+// DirectPath is updated, then cli.Download(msg) is called — which
+// verifies file integrity via SHA256.
 func handleMediaRetryEvent(evt *events.MediaRetry, logger waLog.Logger) {
 	fmt.Printf("MediaRetry event received: id=%s, chat=%s, fromMe=%v\n", evt.MessageID, evt.ChatID.String(), evt.FromMe)
 	mediaRetryCacheLock.Lock()
@@ -719,7 +744,6 @@ func handleMediaRetryEvent(evt *events.MediaRetry, logger waLog.Logger) {
 	mediaRetryCacheLock.Unlock()
 
 	if !ok {
-		// Not our retry request, ignore
 		return
 	}
 
@@ -731,7 +755,7 @@ func handleMediaRetryEvent(evt *events.MediaRetry, logger waLog.Logger) {
 		return
 	}
 
-	// Decrypt the retry notification to get the new direct path
+	// Decrypt the retry notification using the media key
 	retryData, err := whatsmeow.DecryptMediaRetryNotification(evt, pending.MediaKey)
 	if err != nil {
 		pending.Result <- &retryResult{Error: fmt.Errorf("failed to decrypt retry: %v", err)}
@@ -744,20 +768,25 @@ func handleMediaRetryEvent(evt *events.MediaRetry, logger waLog.Logger) {
 	}
 
 	// Success — we have a new direct path
-	newPath := retryData.GetDirectPath()
-	newURL := fmt.Sprintf("https://mmg.whatsapp.net%s", newPath)
-
 	logger.Infof("MediaRetry success for %s: new path obtained", evt.MessageID)
-	pending.Result <- &retryResult{DirectPath: newPath, URL: newURL}
+	pending.Result <- &retryResult{DirectPath: retryData.GetDirectPath()}
 }
 
 // downloadWithRetry attempts to download media, and if it fails with
-// 403/404/410, sends a MediaRetryReceipt to the phone to re-upload the file.
+// 403/404/410, uses the canonical whatsmeow MediaRetry flow:
+//
+//  1. Deserialize the stored WebMessageInfo proto from DB
+//  2. ParseWebMessage → get correct MessageInfo (with proper sender/participant)
+//  3. SendMediaRetryReceipt with the correct MessageInfo + mediaKey
+//  4. On events.MediaRetry response → update DirectPath in the message
+//  5. cli.Download(msg) — full integrity verification via SHA256
+//
+// This follows the whatsmeow documentation in mediaretry.go exactly.
 func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 	messageID, chatJID string, maxRetries int) (bool, string, string, string, error) {
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		// Try to download normally
+		// Try to download normally first
 		success, mediaType, filename, absPath, err := downloadMedia(client, messageStore, messageID, chatJID)
 		if success {
 			return true, mediaType, filename, absPath, nil
@@ -778,73 +807,58 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 		fmt.Printf("Download failed (%v), attempting media retry %d/%d for %s\n",
 			err, attempt+1, maxRetries, messageID)
 
-		// Get media info from DB
-		_, _, _, mediaKey, _, _, _, mediaErr := messageStore.GetMediaInfo(messageID, chatJID)
-		if mediaErr != nil || len(mediaKey) == 0 {
-			return false, mediaType, filename, "", fmt.Errorf("cannot retry: no media key (%v)", err)
+		// === Canonical whatsmeow MediaRetry flow ===
+
+		// Step 1: Retrieve the serialized WebMessageInfo proto from DB
+		protoBytes, protoErr := messageStore.GetMessageProto(messageID, chatJID)
+		if protoErr != nil || len(protoBytes) == 0 {
+			return false, mediaType, filename, "", fmt.Errorf("cannot retry: no stored proto (%v) (original: %v)", protoErr, err)
 		}
 
-		// Parse JID
+		// Step 2: Deserialize into waWeb.WebMessageInfo
+		var webMsg waWeb.WebMessageInfo
+		if unmarshalErr := proto.Unmarshal(protoBytes, &webMsg); unmarshalErr != nil {
+			return false, mediaType, filename, "", fmt.Errorf("failed to unmarshal proto: %v (original: %v)", unmarshalErr, err)
+		}
+
+		// Step 3: ParseWebMessage to get correct MessageInfo with proper sender
 		jid, jidErr := types.ParseJID(chatJID)
 		if jidErr != nil {
 			return false, mediaType, filename, "", fmt.Errorf("cannot parse JID: %v", jidErr)
 		}
 
-		// Build MessageInfo for SendMediaRetryReceipt
-		msgInfo := types.MessageInfo{
-			MessageSource: types.MessageSource{
-				Chat:     jid,
-				IsFromMe: false,
-				IsGroup:  strings.Contains(chatJID, "@g.us"),
-			},
-		}
-		msgInfo.ID = messageID
-		msgInfo.Sender = jid
-
-		// Determine sender and is_from_me from DB
-		var dbIsFromMe bool
-		var dbSender string
-		_ = messageStore.db.QueryRow(
-			"SELECT is_from_me, sender FROM messages WHERE id = ? AND chat_jid = ?",
-			messageID, chatJID,
-		).Scan(&dbIsFromMe, &dbSender)
-		msgInfo.IsFromMe = dbIsFromMe
-		// For MediaRetry, the phone needs to identify the message.
-		// In groups, the sender field in the retry receipt should be the message author.
-		// History sync often doesn't store the real participant, so if the sender
-		// looks like a group ID, we fall back to our own JID (the receipt is sent
-		// to ourselves anyway — the phone resolves the message by chat+id).
-		if msgInfo.IsGroup {
-			realSender := dbSender
-			// Group IDs are long numeric strings (typically 15+ digits)
-			if realSender == "" || len(realSender) > 15 {
-				// Use own JID as fallback — the phone will resolve the message
-				if client.Store != nil && client.Store.ID != nil {
-					msgInfo.Sender = client.Store.ID.ToNonAD()
-				}
-			} else {
-				if !strings.Contains(realSender, "@") {
-					realSender = realSender + "@s.whatsapp.net"
-				}
-				senderJID, sErr := types.ParseJID(realSender)
-				if sErr == nil {
-					msgInfo.Sender = senderJID
-				}
-			}
-		} else {
-			if dbSender != "" {
-				realSender := dbSender
-				if !strings.Contains(realSender, "@") {
-					realSender = realSender + "@s.whatsapp.net"
-				}
-				senderJID, sErr := types.ParseJID(realSender)
-				if sErr == nil {
-					msgInfo.Sender = senderJID
-				}
-			}
+		parsedEvt, parseErr := client.ParseWebMessage(jid, &webMsg)
+		if parseErr != nil {
+			return false, mediaType, filename, "", fmt.Errorf("ParseWebMessage failed: %v (original: %v)", parseErr, err)
 		}
 
-		// Set up pending retry in cache
+		// Step 4: Extract the media message part and its mediaKey
+		// Per docs: "replace this with the part of the message you want to download"
+		var downloadableMsg whatsmeow.DownloadableMessage
+		var mediaKey []byte
+
+		if img := parsedEvt.Message.GetImageMessage(); img != nil {
+			downloadableMsg = img
+			mediaKey = img.GetMediaKey()
+		} else if doc := parsedEvt.Message.GetDocumentMessage(); doc != nil {
+			downloadableMsg = doc
+			mediaKey = doc.GetMediaKey()
+		} else if vid := parsedEvt.Message.GetVideoMessage(); vid != nil {
+			downloadableMsg = vid
+			mediaKey = vid.GetMediaKey()
+		} else if aud := parsedEvt.Message.GetAudioMessage(); aud != nil {
+			downloadableMsg = aud
+			mediaKey = aud.GetMediaKey()
+		} else if stk := parsedEvt.Message.GetStickerMessage(); stk != nil {
+			downloadableMsg = stk
+			mediaKey = stk.GetMediaKey()
+		}
+
+		if downloadableMsg == nil || len(mediaKey) == 0 {
+			return false, mediaType, filename, "", fmt.Errorf("no downloadable media found in message proto")
+		}
+
+		// Step 5: Set up pending retry in cache
 		pending := &pendingMediaRetry{
 			MessageID:  messageID,
 			ChatJID:    chatJID,
@@ -855,10 +869,12 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 		mediaRetryCache[messageID] = pending
 		mediaRetryCacheLock.Unlock()
 
-		// Send the retry receipt
-		fmt.Printf("Sending MediaRetry: chat=%s, sender=%s, id=%s, isFromMe=%v, isGroup=%v, mediaKey=%d bytes\n",
-			msgInfo.Chat.String(), msgInfo.Sender.String(), msgInfo.ID, msgInfo.IsFromMe, msgInfo.IsGroup, len(mediaKey))
-		retryErr := client.SendMediaRetryReceipt(context.Background(), &msgInfo, mediaKey)
+		// Step 6: Send MediaRetryReceipt with the correct parsed MessageInfo
+		fmt.Printf("Sending MediaRetry: chat=%s, sender=%s, id=%s, isFromMe=%v, isGroup=%v\n",
+			parsedEvt.Info.Chat.String(), parsedEvt.Info.Sender.String(),
+			parsedEvt.Info.ID, parsedEvt.Info.IsFromMe, parsedEvt.Info.IsGroup)
+
+		retryErr := client.SendMediaRetryReceipt(context.Background(), &parsedEvt.Info, mediaKey)
 		if retryErr != nil {
 			mediaRetryCacheLock.Lock()
 			delete(mediaRetryCache, messageID)
@@ -868,7 +884,7 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 
 		fmt.Printf("MediaRetry receipt sent for %s, waiting for phone response...\n", messageID)
 
-		// Wait for the MediaRetry event (with timeout)
+		// Step 7: Wait for the MediaRetry event
 		select {
 		case result := <-pending.Result:
 			mediaRetryCacheLock.Lock()
@@ -876,61 +892,56 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 			mediaRetryCacheLock.Unlock()
 
 			if result.Error != nil {
-				if attempt < maxRetries {
-					fmt.Printf("MediaRetry failed (%v), retrying...\n", result.Error)
-					continue
-				}
 				return false, mediaType, filename, "", result.Error
 			}
 
-			// Success! Update URL in DB so downloadMedia uses the new path
-			fmt.Printf("Got new media path for %s, retrying download...\n", messageID)
-			// For MediaRetry downloads, the old SHA hashes are stale (phone re-uploaded).
-			// Use DownloadMediaWithOnlyPath which doesn't require SHA hashes.
-			// Read media type AND filename from DB
-			mType, dbFilename, _, _, _, _, _, _ := messageStore.GetMediaInfo(messageID, chatJID)
-			if mType == "" {
-				mType = mediaType
-			}
-			if filename == "" && dbFilename != "" {
-				filename = dbFilename
-			}
-			var waMediaType whatsmeow.MediaType
-			switch mType {
-			case "image":
-				waMediaType = whatsmeow.MediaImage
-			case "video":
-				waMediaType = whatsmeow.MediaVideo
-			case "audio":
-				waMediaType = whatsmeow.MediaAudio
-			default:
-				waMediaType = whatsmeow.MediaDocument
-			}
-			_ = waMediaType
+			// Step 8: Update DirectPath in the message and download
+			// Per docs: "imageMsg.DirectPath = retryData.DirectPath; data, err := cli.Download(imageMsg)"
+			fmt.Printf("Got new media path for %s, downloading with SHA verification...\n", messageID)
 
-			// Download using only the new path (no SHA needed)
-			mediaData, dlErr := client.DownloadMediaWithOnlyPath(context.Background(), result.DirectPath)
+			// Update the direct path on the downloadable message
+			switch m := downloadableMsg.(type) {
+			case *waProto.ImageMessage:
+				m.DirectPath = &result.DirectPath
+			case *waProto.DocumentMessage:
+				m.DirectPath = &result.DirectPath
+			case *waProto.VideoMessage:
+				m.DirectPath = &result.DirectPath
+			case *waProto.AudioMessage:
+				m.DirectPath = &result.DirectPath
+			case *waProto.StickerMessage:
+				m.DirectPath = &result.DirectPath
+			}
+
+			mediaData, dlErr := client.Download(context.Background(), downloadableMsg)
 			if dlErr != nil {
-				return false, mType, filename, "", fmt.Errorf("retry download failed: %v", dlErr)
+				return false, mediaType, filename, "", fmt.Errorf("download after retry failed: %v", dlErr)
 			}
 
 			// Save the downloaded media
 			chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
 			if mkErr := os.MkdirAll(chatDir, 0755); mkErr != nil {
-				return false, mType, filename, "", fmt.Errorf("failed to create dir: %v", mkErr)
+				return false, mediaType, filename, "", fmt.Errorf("failed to create dir: %v", mkErr)
 			}
-			// Ensure filename is set
 			if filename == "" {
-				filename = fmt.Sprintf("%s.%s", messageID, mType)
+				mType, dbFilename, _, _, _, _, _, _ := messageStore.GetMediaInfo(messageID, chatJID)
+				if mType != "" {
+					mediaType = mType
+				}
+				if dbFilename != "" {
+					filename = dbFilename
+				} else {
+					filename = fmt.Sprintf("%s.%s", messageID, mediaType)
+				}
 			}
 			localPath := fmt.Sprintf("%s/%s", chatDir, filename)
 			absPath, _ := filepath.Abs(localPath)
 			if writeErr := os.WriteFile(localPath, mediaData, 0644); writeErr != nil {
-				return false, mType, filename, "", fmt.Errorf("failed to save: %v", writeErr)
+				return false, mediaType, filename, "", fmt.Errorf("failed to save: %v", writeErr)
 			}
 
-			fmt.Printf("Successfully downloaded (via retry) %s to %s (%d bytes)\n", mType, absPath, len(mediaData))
-			return true, mType, filename, absPath, nil
+			fmt.Printf("Successfully downloaded (via retry) %s to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+			return true, mediaType, filename, absPath, nil
 
 		case <-time.After(60 * time.Second):
 			mediaRetryCacheLock.Lock()
@@ -1446,6 +1457,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				// Serialize the full WebMessageInfo proto for potential MediaRetry
+				var historyProtoBytes []byte
+				if msg.Message != nil {
+					historyProtoBytes, _ = proto.Marshal(msg.Message)
+				}
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
@@ -1460,6 +1477,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					historyProtoBytes,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
