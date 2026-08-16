@@ -23,22 +23,22 @@ import (
 
 	"bytes"
 
+	"go.mau.fi/util/random"
 	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
-	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
-	waMmsRetry "go.mau.fi/whatsmeow/proto/waMmsRetry"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
+	waMmsRetry "go.mau.fi/whatsmeow/proto/waMmsRetry"
 	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
-	waBinary "go.mau.fi/whatsmeow/binary"
-	"go.mau.fi/whatsmeow/util/gcmutil"
-	"go.mau.fi/whatsmeow/util/hkdfutil"
-	"go.mau.fi/util/random"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/gcmutil"
+	"go.mau.fi/whatsmeow/util/hkdfutil"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
@@ -231,7 +231,67 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// persistChatJID picks the chat row incoming history already uses.
+// Sending to a phone JID while the live thread is @lid used to make
+// outgoing text invisible to list_messages on the LID chat.
+func persistChatJID(client *whatsmeow.Client, messageStore *MessageStore, recipient types.JID) types.JID {
+	chat := recipient.ToNonAD()
+	if chat.Server != types.DefaultUserServer || client.Store.LIDs == nil {
+		return chat
+	}
+	lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), chat)
+	if err != nil || lid.IsEmpty() {
+		return chat
+	}
+	lid = lid.ToNonAD()
+	var existing string
+	if err := messageStore.db.QueryRow("SELECT jid FROM chats WHERE jid = ?", lid.String()).Scan(&existing); err == nil && existing != "" {
+		return lid
+	}
+	return chat
+}
+
+func persistOutgoing(client *whatsmeow.Client, messageStore *MessageStore, recipient types.JID, msg *waProto.Message, resp whatsmeow.SendResponse) {
+	if messageStore == nil || msg == nil {
+		return
+	}
+	chat := persistChatJID(client, messageStore, recipient)
+	content := extractTextContent(msg)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	if content == "" && mediaType == "" {
+		return
+	}
+	ts := resp.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	id := string(resp.ID)
+	if id == "" {
+		id = fmt.Sprintf("local-%d", ts.UnixNano())
+	}
+	sender := ""
+	if client.Store.ID != nil {
+		sender = client.Store.ID.User
+	}
+	name := chat.User
+	var existing string
+	if err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chat.String()).Scan(&existing); err == nil && existing != "" {
+		name = existing
+	}
+	if err := messageStore.StoreChat(chat.String(), name, ts); err != nil {
+		fmt.Printf("persistOutgoing: store chat: %v\n", err)
+	}
+	var protoBytes []byte
+	protoBytes, _ = proto.Marshal(msg)
+	if err := messageStore.StoreMessage(
+		id, chat.String(), sender, content, ts, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, protoBytes,
+	); err != nil {
+		fmt.Printf("persistOutgoing: store message: %v\n", err)
+	}
+}
+
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -390,12 +450,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
+	persistOutgoing(client, messageStore, recipientJID, msg, resp)
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
@@ -723,13 +784,13 @@ var (
 
 // pendingMediaRetry stores context needed to complete a media retry
 type pendingMediaRetry struct {
-	MessageID   string
-	ChatJID     string
-	MediaKey    []byte
-	MediaType   string
-	Filename    string
-	FileLength  uint64
-	Result      chan *retryResult
+	MessageID  string
+	ChatJID    string
+	MediaKey   []byte
+	MediaType  string
+	Filename   string
+	FileLength uint64
+	Result     chan *retryResult
 }
 
 type retryResult struct {
@@ -873,10 +934,10 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 
 		// Step 5: Set up pending retry in cache
 		pending := &pendingMediaRetry{
-			MessageID:  messageID,
-			ChatJID:    chatJID,
-			MediaKey:   mediaKey,
-			Result:     make(chan *retryResult, 1),
+			MessageID: messageID,
+			ChatJID:   chatJID,
+			MediaKey:  mediaKey,
+			Result:    make(chan *retryResult, 1),
 		}
 		mediaRetryCacheLock.Lock()
 		mediaRetryCache[messageID] = pending
@@ -914,75 +975,75 @@ func downloadWithRetry(client *whatsmeow.Client, messageStore *MessageStore,
 			mediaRetryCacheLock.Unlock()
 
 			if result.Error != nil {
-					errStr := result.Error.Error()
-					if strings.Contains(errStr, "code 2") && attempt < maxRetries {
-						// Error code 2: try PN participant, then on-demand history sync
-						pnSender, pnErr := resolveLIDToPN(client, parsedEvt.Info.Sender)
-						ownLID := client.Store.GetLID()
+				errStr := result.Error.Error()
+				if strings.Contains(errStr, "code 2") && attempt < maxRetries {
+					// Error code 2: try PN participant, then on-demand history sync
+					pnSender, pnErr := resolveLIDToPN(client, parsedEvt.Info.Sender)
+					ownLID := client.Store.GetLID()
 
-						if pnErr == nil && !pnSender.IsEmpty() && pnSender.String() != parsedEvt.Info.Sender.String() {
-							for _, toAddr := range []types.JID{ownLID, ownID} {
-								pnResultCh := make(chan *retryResult, 1)
+					if pnErr == nil && !pnSender.IsEmpty() && pnSender.String() != parsedEvt.Info.Sender.String() {
+						for _, toAddr := range []types.JID{ownLID, ownID} {
+							pnResultCh := make(chan *retryResult, 1)
+							mediaRetryCacheLock.Lock()
+							mediaRetryCache[messageID] = &pendingMediaRetry{Result: pnResultCh, MediaKey: mediaKey}
+							mediaRetryCacheLock.Unlock()
+
+							pnStanza := buildRetryStanza(toAddr, messageID, parsedEvt.Info.Chat, parsedEvt.Info.IsFromMe, pnSender, mediaKey)
+							fmt.Printf("Sending MediaRetry (to=%s, participant=%s)\n", toAddr.String(), pnSender.String())
+							if sendErr := client.DangerousInternals().SendNode(context.Background(), pnStanza); sendErr != nil {
+								fmt.Printf("Send failed: %v\n", sendErr)
+								continue
+							}
+
+							select {
+							case pnResult := <-pnResultCh:
 								mediaRetryCacheLock.Lock()
-								mediaRetryCache[messageID] = &pendingMediaRetry{Result: pnResultCh, MediaKey: mediaKey}
+								delete(mediaRetryCache, messageID)
 								mediaRetryCacheLock.Unlock()
-
-								pnStanza := buildRetryStanza(toAddr, messageID, parsedEvt.Info.Chat, parsedEvt.Info.IsFromMe, pnSender, mediaKey)
-								fmt.Printf("Sending MediaRetry (to=%s, participant=%s)\n", toAddr.String(), pnSender.String())
-								if sendErr := client.DangerousInternals().SendNode(context.Background(), pnStanza); sendErr != nil {
-									fmt.Printf("Send failed: %v\n", sendErr)
-									continue
+								if pnResult.Error == nil {
+									fmt.Printf("MediaRetry SUCCESS!\n")
+									result = pnResult
+									// Break out of error handling — fall through to download
+									goto downloadMedia
 								}
-
-								select {
-								case pnResult := <-pnResultCh:
-									mediaRetryCacheLock.Lock()
-									delete(mediaRetryCache, messageID)
-									mediaRetryCacheLock.Unlock()
-									if pnResult.Error == nil {
-										fmt.Printf("MediaRetry SUCCESS!\n")
-										result = pnResult
-										// Break out of error handling — fall through to download
-										goto downloadMedia
-									}
-									fmt.Printf("Got error: %v\n", pnResult.Error)
-								case <-time.After(15 * time.Second):
-									fmt.Printf("Timeout\n")
-									mediaRetryCacheLock.Lock()
-									delete(mediaRetryCache, messageID)
-									mediaRetryCacheLock.Unlock()
-								}
+								fmt.Printf("Got error: %v\n", pnResult.Error)
+							case <-time.After(15 * time.Second):
+								fmt.Printf("Timeout\n")
+								mediaRetryCacheLock.Lock()
+								delete(mediaRetryCache, messageID)
+								mediaRetryCacheLock.Unlock()
 							}
 						}
-
-						// On-demand history sync with newer anchor to get fresh URLs
-						fmt.Printf("Requesting on-demand history sync with newer anchor...\n")
-						_, odErr := requestOnDemandHistory(client, messageStore, messageID, chatJID)
-						if odErr != nil {
-							fmt.Printf("On-demand history sync failed: %v\n", odErr)
-						} else {
-							fmt.Printf("On-demand history sync done, retrying...\n")
-							continue // retry loop — will re-read updated proto from DB
-						}
 					}
-					return false, mediaType, filename, "", result.Error
+
+					// On-demand history sync with newer anchor to get fresh URLs
+					fmt.Printf("Requesting on-demand history sync with newer anchor...\n")
+					_, odErr := requestOnDemandHistory(client, messageStore, messageID, chatJID)
+					if odErr != nil {
+						fmt.Printf("On-demand history sync failed: %v\n", odErr)
+					} else {
+						fmt.Printf("On-demand history sync done, retrying...\n")
+						continue // retry loop — will re-read updated proto from DB
+					}
 				}
+				return false, mediaType, filename, "", result.Error
+			}
 
-			downloadMedia:
-				// Step 8: Update DirectPath in the message and download
-				fmt.Printf("Got new media path for %s, downloading with SHA verification...\n", messageID)
+		downloadMedia:
+			// Step 8: Update DirectPath in the message and download
+			fmt.Printf("Got new media path for %s, downloading with SHA verification...\n", messageID)
 
-				// Update the direct path on the downloadable message
-				switch m := downloadableMsg.(type) {
-				case *waProto.ImageMessage:
-					m.DirectPath = &result.DirectPath
-				case *waProto.DocumentMessage:
-					m.DirectPath = &result.DirectPath
-				case *waProto.VideoMessage:
-					m.DirectPath = &result.DirectPath
-				case *waProto.AudioMessage:
-					m.DirectPath = &result.DirectPath
-				case *waProto.StickerMessage:
+			// Update the direct path on the downloadable message
+			switch m := downloadableMsg.(type) {
+			case *waProto.ImageMessage:
+				m.DirectPath = &result.DirectPath
+			case *waProto.DocumentMessage:
+				m.DirectPath = &result.DirectPath
+			case *waProto.VideoMessage:
+				m.DirectPath = &result.DirectPath
+			case *waProto.AudioMessage:
+				m.DirectPath = &result.DirectPath
+			case *waProto.StickerMessage:
 				m.DirectPath = &result.DirectPath
 			}
 
@@ -1372,7 +1433,7 @@ document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1645,9 +1706,9 @@ document.getElementById('q').src='/qr?t='+Date.now()}setInterval(r,5000)</script
 			return
 		}
 		var req struct {
-			ChatJID    string `json:"chat_jid"`
-			MessageID  string `json:"message_id"`
-			SenderPN   string `json:"sender_pn"` // Optional: phone number JID
+			ChatJID   string `json:"chat_jid"`
+			MessageID string `json:"message_id"`
+			SenderPN  string `json:"sender_pn"` // Optional: phone number JID
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
